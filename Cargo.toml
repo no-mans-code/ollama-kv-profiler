@@ -1,0 +1,14 @@
+[package]
+name = "ollama-kv-profiler"
+version = "0.1.0"
+edition = "2021"
+description = "Profiles a local Ollama server to decide, per (model, context size, GPU/CPU split), whether reusing its short-lived generation context beats cold reprocessing."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+rand = "0.8"
