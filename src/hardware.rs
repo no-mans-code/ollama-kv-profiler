@@ -24,6 +24,65 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+/// Below this fraction free, a resource is "contended" - see
+/// [`vram_free_fraction`]/[`ram_free_fraction`] and issues #1/#2.
+pub const FAIRNESS_THRESHOLD: f64 = 0.90;
+
+/// Live free VRAM fraction across the whole system (not just what this
+/// tool or Ollama is using) - via `nvidia-smi`, NVIDIA-only for now (see
+/// issue #1: no cross-vendor support yet, a known, stated limitation
+/// rather than a silent gap). Returns `None` rather than erroring when
+/// `nvidia-smi` isn't available (e.g. no NVIDIA GPU, or an AMD/Intel-only
+/// system) - the caller decides whether that's fatal.
+pub fn vram_free_fraction() -> Option<f64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (used, total) = text.trim().lines().next()?.split_once(',')?;
+    let used: f64 = used.trim().parse().ok()?;
+    let total: f64 = total.trim().parse().ok()?;
+    if total <= 0.0 {
+        return None;
+    }
+    Some(1.0 - (used / total))
+}
+
+/// Live free system RAM fraction - cross-platform (unlike
+/// [`vram_free_fraction`], which is NVIDIA-only), via `sysinfo`.
+pub fn ram_free_fraction() -> Option<f64> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total == 0 {
+        return None;
+    }
+    Some(sys.available_memory() as f64 / total as f64)
+}
+
+/// A one-line warning if `free_fraction` is below [`FAIRNESS_THRESHOLD`],
+/// naming the resource and the real numbers - `None` if there's nothing to
+/// warn about (fraction unknown, or comfortably free). Never blocks the
+/// caller: per issues #1/#2, a contended run still produces a result, just
+/// a labeled one - the person running this may not be able to free the
+/// resource (another long-running job, a desktop compositor), and a
+/// degraded-but-labeled measurement is more useful than none.
+pub fn fairness_warning(resource: &str, free_fraction: Option<f64>) -> Option<String> {
+    let free = free_fraction?;
+    if free >= FAIRNESS_THRESHOLD {
+        return None;
+    }
+    Some(format!(
+        "WARNING: only {:.0}% of {resource} is free (something else is using {:.0}%) - this run's timings may not be representative of an idle system",
+        free * 100.0,
+        (1.0 - free) * 100.0
+    ))
+}
+
 /// Measures real sequential read bandwidth to a fresh temp file - the
 /// practical proxy for "how fast could a real KV-cache-to-disk swap read
 /// its saved state back," since a KV blob is read sequentially in one
@@ -130,5 +189,30 @@ mod tests {
         // Same model/speed, but a slow eMMC-class device (~100 MB/s).
         let p = predict_crossover(36_864, 100_000_000.0, 10_000.0);
         assert!(!p.disk_swap_would_win_at_short_to_medium_context);
+    }
+
+    #[test]
+    fn fairness_warning_fires_below_threshold() {
+        let w = fairness_warning("VRAM", Some(0.75));
+        assert!(w.is_some());
+        assert!(w.unwrap().contains("75%"));
+    }
+
+    #[test]
+    fn fairness_warning_silent_above_threshold() {
+        assert!(fairness_warning("VRAM", Some(0.95)).is_none());
+    }
+
+    #[test]
+    fn fairness_warning_silent_when_unknown() {
+        assert!(fairness_warning("VRAM", None).is_none());
+    }
+
+    #[test]
+    fn ram_free_fraction_returns_a_plausible_value() {
+        // Real, live check - not mocked. Should always succeed on any
+        // real machine and land in (0, 1].
+        let f = ram_free_fraction().expect("sysinfo should report real system RAM");
+        assert!(f > 0.0 && f <= 1.0, "implausible RAM free fraction: {f}");
     }
 }

@@ -6,6 +6,7 @@ use clap::Parser;
 use ollama_kv_profiler::bench::{self, profile, quick_cold_tokens_per_sec, RunConfig, Verdict};
 use ollama_kv_profiler::hardware::{kv_bytes_per_token, measure_disk_read_bandwidth_bytes_per_sec, predict_crossover, CrossoverPrediction};
 use ollama_kv_profiler::ollama::Client;
+use ollama_kv_profiler::predictor::{self, DocumentCache};
 
 /// Profiles a local Ollama server to decide, per (model, context size,
 /// GPU/CPU split), whether reusing its short-lived generation context
@@ -60,6 +61,20 @@ struct Cli {
     /// Size of the temp file used to measure real disk read bandwidth
     #[arg(long, default_value_t = 256)]
     disk_bench_mb: usize,
+    /// Live prediction mode: for each rep, predict ingest time (from a
+    /// live system snapshot) and swap time (if the document is already in
+    /// the on-disk LRU cache), then measure the real thing and report how
+    /// close the prediction was. Overrides --predict-only and the full
+    /// sweep - runs instead of them.
+    #[arg(long)]
+    live_validate: bool,
+    /// Repetitions for --live-validate - each produces one real ingest
+    /// comparison and one real swap comparison
+    #[arg(long, default_value_t = 10)]
+    live_reps: usize,
+    /// Where the on-disk LRU document-context cache lives for --live-validate
+    #[arg(long, default_value = ".ollama-kv-profiler-cache/documents.redb")]
+    cache_path: PathBuf,
 }
 
 fn gpu_mode_setting(label: &str) -> Result<Option<i32>> {
@@ -84,6 +99,46 @@ fn main() -> Result<()> {
     let client = Client::new(&cli.host);
     let mut results = Vec::new();
     let mut predictions = Vec::new();
+    let mut live_outcomes = Vec::new();
+
+    if cli.live_validate {
+        if let Some(parent) = cli.cache_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let cache_capacity = kvcache::default_capacity_bytes(&cli.cache_path)?;
+        let cache = DocumentCache::open(&cli.cache_path, cache_capacity)?;
+
+        for model in &cli.models {
+            let max_ctx = client
+                .max_context_length(model)
+                .with_context(|| format!("failed to read `{model}`'s context length - has it been pulled?"))?;
+            let arch = client.architecture_info(model)?;
+            let kv_bytes = kv_bytes_per_token(arch.num_layers, arch.num_kv_heads, arch.head_dim, cli.kv_dtype_bytes);
+            println!("\n=== {model} live validation ({:.1} KB/token KV cache) ===", kv_bytes as f64 / 1024.0);
+
+            for gpu_label in &cli.gpu_modes {
+                let num_gpu = gpu_mode_setting(gpu_label)?;
+                let fraction = cli.context_fractions.first().copied().unwrap_or(0.15);
+                let num_ctx = ((max_ctx as f64 * fraction).round() as u32).max(512);
+                let target_tokens = (num_ctx as u64).saturating_sub(200);
+
+                println!("  [{gpu_label}] {} reps...", cli.live_reps);
+                let outcomes = predictor::validate(
+                    &client, &cache, model, num_gpu, num_ctx, target_tokens, disk_bandwidth, cli.live_reps,
+                    &|msg| println!("    {msg}"),
+                )?;
+                live_outcomes.extend(outcomes.into_iter().map(|o| (model.clone(), gpu_label.clone(), o)));
+            }
+        }
+
+        print_live_validation_summary(&live_outcomes);
+        if let Some(path) = &cli.output {
+            std::fs::write(path, serde_json::to_string_pretty(&live_outcomes)?)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("\nFull results written to {}", path.display());
+        }
+        return Ok(());
+    }
 
     for model in &cli.models {
         let max_ctx = client
@@ -234,6 +289,28 @@ fn print_prediction_summary(predictions: &[(String, String, CrossoverPrediction)
             p.disk_bandwidth_bytes_per_sec / 1e6,
             if p.disk_swap_would_win_at_short_to_medium_context { "swap" } else { "reingest" }
         );
+    }
+}
+
+fn print_live_validation_summary(outcomes: &[(String, String, predictor::ValidationOutcome)]) {
+    println!("\n=== Live prediction accuracy ===");
+    println!("{:<22} {:<5} {:<8} {:>4} {:>12} {:>12} {:>10}", "model", "gpu", "scenario", "rep", "predicted ms", "actual ms", "error %");
+    for (model, gpu_label, o) in outcomes {
+        println!(
+            "{:<22} {:<5} {:<8} {:>4} {:>12.1} {:>12.1} {:>9.1}%",
+            model, gpu_label, o.scenario, o.rep + 1, o.predicted_ms, o.actual_ms, o.error_pct
+        );
+    }
+
+    for scenario in ["ingest", "swap"] {
+        let errors: Vec<f64> = outcomes.iter().filter(|(_, _, o)| o.scenario == scenario).map(|(_, _, o)| o.error_pct).collect();
+        if errors.is_empty() {
+            continue;
+        }
+        let n = errors.len() as f64;
+        let mean = errors.iter().sum::<f64>() / n;
+        let max = errors.iter().cloned().fold(0.0, f64::max);
+        println!("\n{scenario}: mean error {mean:.1}%, max error {max:.1}%, over {} real comparisons", errors.len());
     }
 }
 

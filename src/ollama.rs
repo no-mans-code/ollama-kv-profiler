@@ -199,6 +199,10 @@ pub struct GenerateResponse {
     /// Nanoseconds, as Ollama reports it.
     #[serde(default)]
     pub prompt_eval_duration: u64,
+    /// Number of tokens Ollama generated for this call (not the prompt) -
+    /// paired with `eval_duration` to get a real decode tok/s.
+    #[serde(default)]
+    pub eval_count: u64,
     #[serde(default)]
     pub eval_duration: u64,
     /// Nanoseconds spent (re)loading the model into the runner - should be

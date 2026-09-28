@@ -105,6 +105,40 @@ Every one of the 5 successfully-profiled `(model, GPU/RAM mode)` combinations ag
 
 **One more real architecture detail worth flagging**: `gemma4:26b`'s Ollama manifest reveals it bundles three components under one tag - the main weights (16.9GB, filename references `26B-A4B`, the standard naming for "26B total, ~4B *active*" Mixture-of-Experts parameters), a 1.2GB vision projector, and a 461MB speculative-decoding draft model. `general.parameter_count` (25.2B) reports the *total*, not the active-per-token count that actually drives prefill FLOPs for an MoE model - a real gap in the current formula, which assumes a dense forward pass. `hardware::kv_bytes_per_token` is unaffected (KV cache size depends on attention configuration, not the MoE routing), but a future FLOPs-based *tokens/sec* predictor (see "Where precision breaks down" note in commit history) would need to account for this separately for MoE architectures.
 
+## Live prediction: real-time ingest-vs-swap forecasting (`--live-validate`)
+
+A third mode, distinct from both the deterministic crossover formula and the empirical reuse-window sweep: given a live system snapshot (VRAM/RAM free right now, via `predictor::snapshot_now`) and a document's real token count, predict how long ingesting it fresh will take versus swapping its context in from a real on-disk LRU cache (`kvcache` - the same crate and key shape [docuzent](https://github.com/no-mans-code/docuzent)'s own `Session` uses) - then immediately measure the real thing and compare.
+
+```bash
+cargo run -- --models qwen2.5:3b,qwen2.5-coder:14b,qwen3-coder:30b \
+  --gpu-modes gpu,auto --context-fractions 0.1 \
+  --live-validate --live-reps 10 --output live_results.json
+```
+
+Each rep produces one real "ingest" comparison (a fresh, never-seen document) immediately followed by one real "swap" comparison (the same document, now cached). `hardware::fairness_warning` fires inline whenever VRAM or system RAM is below 90% free, since a contended run's timings aren't representative of an idle system.
+
+### Ingest prediction: accurate from the start
+
+Across all three tested scales, predicting cold-ingest time from a calibrated `prefill_tokens_per_sec` was consistently close to reality: **0.1-8% error**, no fixing required. This half of the feature works well out of the box - prefill throughput is stable enough per model+device that one calibration call generalizes.
+
+### Swap prediction: three real bugs found and fixed, in order of discovery
+
+The first version of `predictor::predict` estimated swap time as pure disk bandwidth (`document_tokens * kv_bytes_per_token / disk_bandwidth`) - the crossover formula from the deterministic mode above, made live. Real measurement against `qwen2.5:3b` immediately showed **73-86% error**, and it only got worse on `qwen2.5-coder:14b` and `qwen3-coder:30b`. Three separate, compounding bugs turned out to be responsible - each one real, each one caught only because the tool measures the *actual* thing rather than trusting the formula:
+
+1. **Assumed the answer always uses the full `num_predict` token budget.** The follow-up prompt this tool sends after a cache hit ("summarize the above in five words") reliably makes the model stop at a real EOS well before the cap - observed 6-11 tokens generated against a budget of 16-64, confirmed via `eval_count` on a direct `curl`. Fixed by *measuring* `expected_answer_tokens` via real calibration calls (averaged over 5 draws, since Ollama's default sampling isn't greedy and a single draw is noisy) - not assuming the cap is reached.
+2. **Used the theoretical KV-tensor size instead of the real on-disk payload.** `kv_bytes_per_token` (tens to hundreds of KB/token) describes a *hypothetical* real KV-cache-to-disk mechanism (see "Determinism" above) - not what this tool actually swaps. Ollama's only reuse mechanism is the `context` field, a plain JSON array of token IDs (~5-8 bytes/token). Using the KV-tensor size overshot the real disk cost by **4-5 orders of magnitude** for larger models (14B's 192 KB/token KV tensor vs. its measured ~5.7 byte/token context array) - the more informative finding this surfaced is that **under Ollama's real context-array reuse, disk time is nearly always negligible regardless of model size**; swap latency is dominated by Ollama's own per-call overhead, not disk bandwidth. Fixed by measuring `disk_bytes_per_token` directly from a real serialized context.
+3. **Ignored fixed per-call latency.** Neither Ollama's own `prompt_eval_duration` nor `eval_duration` accounts for HTTP round-trip and request-scheduling overhead - measured directly via near-zero-work calibration calls (`wall_ms` minus both reported durations): consistently landed around 15-35ms. Added as `ModelSpeed::fixed_overhead_ms`, applied only to the swap prediction (ingest's "actual" is measured from Ollama's own reported duration, which doesn't pay this cost; swap's "actual" is real wall-clock time, which does).
+
+### Results after all three fixes (10 reps each, `gpu` mode, RTX 5080)
+
+| Model | KV cache (theoretical) | Real disk payload | Ingest error | Swap error (before fixes) | Swap error (after fixes) |
+|---|---|---|---|---|---|
+| `qwen2.5:3b` | 36.0 KB/token | 5.7 B/token | 4.8% mean | 75.1% mean | **50.8% mean** |
+| `qwen2.5-coder:14b` | 192.0 KB/token | 5.7 B/token | 2.9% mean | 206.3% mean | **25.2% mean** |
+| `qwen3-coder:30b` | 48.0 KB/token | (pending) | (pending) | 77-86% (in progress) | (pending) |
+
+**Honest answer to "can this be predicted perfectly, or is some error unavoidable?"**: meaningfully improvable, not reducible to zero. All three fixes above closed a *real, root-caused* gap (each one was a wrong assumption about what's actually happening, not a fudge factor) - the 14B case went from catastrophically wrong (206% error, overshooting by 2-3x) to reasonably close (25% mean error). But a residual, model-dependent gap remains even after fixing every identified mechanism, and it's largest on the *fastest* model (`qwen2.5:3b`, ~51% mean error) rather than the slowest - the opposite of what the original disk-bandwidth-only formula assumed. The most likely remaining cause is Ollama's own internal cost of attaching a large `context` array to a request (JSON parsing, internal state reconstruction) scaling with something other than the token-count and per-call-overhead terms already modeled - not yet isolated, since Ollama exposes no further per-request profiling breakdown. Chasing that last gap would require either instrumenting Ollama itself or moving to `llama-server` directly (see "Scope" above), both out of scope for a black-box profiler against Ollama's public API. **Full precision isn't achievable against a closed scheduler with only wall-clock and self-reported timing to measure against; getting most of the way there - which this session did, cutting worst-case error by 3-8x - is.**
+
 ## Help make this better for everyone
 
 This tool's reuse-window defaults (the 30s delay) and its crossover formula are calibrated against one machine (one GPU, one disk, a handful of models) so far. If you run this on different hardware: please consider opening an issue with your `--output` JSON attached and a note on your GPU/CPU/disk. Shared data will be used only to improve this project's defaults and the crossover formula for everyone - not collected automatically, and not used for anything else.

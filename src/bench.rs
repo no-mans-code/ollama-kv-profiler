@@ -35,6 +35,7 @@ pub struct RunConfig {
 pub struct Timing {
     pub prompt_eval_count: u64,
     pub prompt_eval_duration_ms: f64,
+    pub eval_count: u64,
     pub eval_duration_ms: f64,
     pub load_duration_ms: f64,
     pub wall_ms: f64,
@@ -129,7 +130,7 @@ fn round_trip_context_through_disk(context: &[i64], label: &str) -> Result<Vec<i
     serde_json::from_slice(&bytes).context("failed to deserialize context read back from disk")
 }
 
-fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[i64]>, num_gpu: Option<i32>, num_ctx: u32) -> Result<(GenerateResponse, Timing)> {
+pub(crate) fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[i64]>, num_gpu: Option<i32>, num_ctx: u32) -> Result<(GenerateResponse, Timing)> {
     let t0 = Instant::now();
     let resp = client.generate(&GenerateRequest {
         model,
@@ -142,6 +143,7 @@ fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[
     let timing = Timing {
         prompt_eval_count: resp.prompt_eval_count,
         prompt_eval_duration_ms: resp.prompt_eval_duration as f64 / 1e6,
+        eval_count: resp.eval_count,
         eval_duration_ms: resp.eval_duration as f64 / 1e6,
         load_duration_ms: resp.load_duration as f64 / 1e6,
         wall_ms,
@@ -183,6 +185,23 @@ pub fn profile(client: &Client, cfg: &RunConfig, on_progress: &dyn Fn(&str)) -> 
         options: GenerateOptions { num_gpu: cfg.num_gpu, num_ctx: cfg.num_ctx, num_predict: crate::ollama::DEFAULT_NUM_PREDICT },
     })?;
     let actual_vram_fraction = client.vram_fraction(&cfg.model)?;
+
+    // Fairness checks (#1/#2): whichever resource this run's real split
+    // actually depends on, warn (never abort) if something else is using
+    // enough of it that timings may not reflect an idle system. Checked
+    // against the REAL post-warmup split, not the requested one, since
+    // `auto` mode's real split is only known after the warmup call.
+    let vram_used = actual_vram_fraction.unwrap_or(if cfg.num_gpu == Some(0) { 0.0 } else { 1.0 });
+    if vram_used > 0.0 {
+        if let Some(w) = crate::hardware::fairness_warning("VRAM", crate::hardware::vram_free_fraction()) {
+            on_progress(&w);
+        }
+    }
+    if vram_used < 1.0 {
+        if let Some(w) = crate::hardware::fairness_warning("system RAM", crate::hardware::ram_free_fraction()) {
+            on_progress(&w);
+        }
+    }
 
     let chars_per_token = calibrate_chars_per_token(client, &cfg.model, cfg.num_gpu, cfg.num_ctx)?;
     let target_chars = (cfg.target_tokens as f64 * chars_per_token).round() as usize;
