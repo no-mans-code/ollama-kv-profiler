@@ -6,8 +6,24 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Every call in this tool only cares about prefill cost, never the
+/// generated text - a small, uniform cap keeps the eval (decode) phase
+/// fast and bounded everywhere, rather than left open-ended.
+pub const DEFAULT_NUM_PREDICT: i32 = 16;
+
 pub struct Client {
     host: String,
+}
+
+/// The architecture parameters that determine a model's KV-cache size per
+/// token: `2 * num_layers * num_kv_heads * head_dim * dtype_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ArchitectureInfo {
+    pub num_layers: u32,
+    /// The *key/value* head count, not the (often larger) query head count
+    /// grouped-query attention models report separately.
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
 }
 
 impl Client {
@@ -34,6 +50,43 @@ impl Client {
             .and_then(|(_, v)| v.as_u64())
             .with_context(|| format!("no *.context_length field for `{model}`"))?;
         Ok(context_length as u32)
+    }
+
+    /// The architecture parameters that determine KV-cache size per token -
+    /// read from `/api/show`'s `model_info`, not assumed. Field names carry
+    /// an architecture-family prefix (`qwen2.*`, `llama.*`, ...), found by
+    /// suffix rather than hardcoded per family, same as `max_context_length`.
+    pub fn architecture_info(&self, model: &str) -> Result<ArchitectureInfo> {
+        let url = format!("{}/api/show", self.host.trim_end_matches('/'));
+        let resp: Value = ureq::post(&url)
+            .send_json(serde_json::json!({ "model": model }))
+            .with_context(|| format!("ollama show request to {url} failed"))?
+            .into_json()
+            .context("failed to parse ollama show response")?;
+        let model_info = resp
+            .get("model_info")
+            .and_then(|v| v.as_object())
+            .context("no model_info object in show response")?;
+
+        let find_u64 = |suffix: &str| -> Option<u64> {
+            model_info.iter().find(|(k, _)| k.ends_with(suffix)).and_then(|(_, v)| v.as_u64())
+        };
+
+        let num_layers = find_u64(".block_count").with_context(|| format!("no *.block_count for `{model}`"))?;
+        let embedding_length = find_u64(".embedding_length").with_context(|| format!("no *.embedding_length for `{model}`"))?;
+        let head_count = find_u64(".attention.head_count").with_context(|| format!("no *.attention.head_count for `{model}`"))?;
+        // Grouped-query attention models report a smaller KV head count
+        // separately - that's what actually sets KV-cache size, not the
+        // (larger) query head count. Falls back to head_count for
+        // architectures that don't use GQA and so don't report it.
+        let num_kv_heads = find_u64(".attention.head_count_kv").unwrap_or(head_count);
+        let head_dim = embedding_length / head_count.max(1);
+
+        Ok(ArchitectureInfo {
+            num_layers: num_layers as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+        })
     }
 
     /// Ground truth for how much of a currently-loaded model actually sits
@@ -75,8 +128,18 @@ impl Client {
 
 #[derive(Serialize)]
 pub struct GenerateOptions {
-    pub num_gpu: i32,
+    /// `None` omits the field entirely, letting Ollama pick its own
+    /// GPU/RAM split - the realistic "spill whatever doesn't fit into RAM"
+    /// behavior, as opposed to a forced extreme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_gpu: Option<i32>,
     pub num_ctx: u32,
+    /// Caps how many tokens the model generates in its response. This
+    /// tool only cares about prefill (`prompt_eval_*`) cost, never the
+    /// answer text itself - left unbounded, a model can ramble on for an
+    /// open-ended filler-text prompt, inflating wall time and eval_count
+    /// unpredictably for a measurement that isn't even about generation.
+    pub num_predict: i32,
 }
 
 #[derive(Serialize)]

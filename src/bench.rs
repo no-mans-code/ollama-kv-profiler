@@ -1,13 +1,19 @@
 //! The core measurement: for one (model, GPU/CPU split, context size), how
-//! much does reusing Ollama's `context` token array actually save versus a
-//! cold call, measured immediately after and again after a delay with a
-//! distraction call in between (an attempt to actually evict whatever
-//! internal state made the immediate case fast, rather than just letting
-//! time pass and hoping).
+//! much does reusing Ollama's `context` token array - genuinely
+//! round-tripped through a disk file each time, not kept in a Rust
+//! variable, to faithfully match how a real caller (e.g. docuzent's
+//! `kvcache`-backed `Session`) actually persists and reloads it - save
+//! versus a cold call that reingests the document from scratch. Measured
+//! immediately after and again after a delay with a distraction call in
+//! between (an attempt to actually evict whatever internal state made the
+//! immediate case fast, rather than just letting time pass and hoping).
+//! Runs identically whether the model is fully VRAM-resident or offloaded
+//! to RAM (or split between the two) - that's the `gpu_label`/
+//! `actual_vram_fraction` axis on [`ProfileResult`], not a separate code path.
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::ollama::{Client, GenerateOptions, GenerateRequest, GenerateResponse};
@@ -16,7 +22,7 @@ use crate::textgen::{calibrate_chars_per_token, filler_text};
 pub struct RunConfig {
     pub model: String,
     /// What was requested: 999 for "force full GPU", 0 for "force full CPU".
-    pub num_gpu: i32,
+    pub num_gpu: Option<i32>,
     /// Human label for `num_gpu`, e.g. "gpu" or "cpu".
     pub gpu_label: String,
     pub num_ctx: u32,
@@ -96,7 +102,7 @@ fn decide(cold: &Aggregate, immediate: &Aggregate, delayed: &Aggregate) -> Verdi
 pub struct ProfileResult {
     pub model: String,
     pub gpu_label: String,
-    pub requested_num_gpu: i32,
+    pub requested_num_gpu: Option<i32>,
     /// Ground truth from `/api/ps`: fraction of the model's weights
     /// actually resident in VRAM during this run, if Ollama reported it.
     pub actual_vram_fraction: Option<f64>,
@@ -109,9 +115,29 @@ pub struct ProfileResult {
     pub verdict: Verdict,
 }
 
-fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[i64]>, num_gpu: i32, num_ctx: u32) -> Result<(GenerateResponse, Timing)> {
+/// Writes a context array to a real file and reads it back, rather than
+/// keeping it in a Rust variable across calls - a faithful stand-in for
+/// the actual disk-persisted swap this tool exists to evaluate (matching
+/// how a real caller, e.g. docuzent's `kvcache`-backed `Session`, would
+/// genuinely round-trip it through disk between requests), not an
+/// in-memory shortcut that happens to look equivalent.
+fn round_trip_context_through_disk(context: &[i64], label: &str) -> Result<Vec<i64>> {
+    let path = std::env::temp_dir().join(format!("ollama-kv-profiler-context-{label}-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_vec(context)?).with_context(|| format!("failed to write {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_slice(&bytes).context("failed to deserialize context read back from disk")
+}
+
+fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[i64]>, num_gpu: Option<i32>, num_ctx: u32) -> Result<(GenerateResponse, Timing)> {
     let t0 = Instant::now();
-    let resp = client.generate(&GenerateRequest { model, prompt, stream: false, context, options: GenerateOptions { num_gpu, num_ctx } })?;
+    let resp = client.generate(&GenerateRequest {
+        model,
+        prompt,
+        stream: false,
+        context,
+        options: GenerateOptions { num_gpu, num_ctx, num_predict: crate::ollama::DEFAULT_NUM_PREDICT },
+    })?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let timing = Timing {
         prompt_eval_count: resp.prompt_eval_count,
@@ -121,6 +147,25 @@ fn timed_generate(client: &Client, model: &str, prompt: &str, context: Option<&[
         wall_ms,
     };
     Ok((resp, timing))
+}
+
+/// A fast path for [`crate::hardware`]'s crossover prediction: just enough
+/// to get a real cold prefill tokens/sec for this model+device+context -
+/// one warmup call plus one timed cold call, skipping the immediate/
+/// delayed/distraction measurements a full [`profile`] run does.
+pub fn quick_cold_tokens_per_sec(client: &Client, model: &str, num_gpu: Option<i32>, num_ctx: u32, target_tokens: u64) -> Result<f64> {
+    let _ = client.generate(&GenerateRequest {
+        model,
+        prompt: "warmup",
+        stream: false,
+        context: None,
+        options: GenerateOptions { num_gpu, num_ctx, num_predict: crate::ollama::DEFAULT_NUM_PREDICT },
+    })?;
+    let chars_per_token = calibrate_chars_per_token(client, model, num_gpu, num_ctx)?;
+    let target_chars = (target_tokens as f64 * chars_per_token).round() as usize;
+    let text = filler_text(target_chars);
+    let (_, timing) = timed_generate(client, model, &text, None, num_gpu, num_ctx)?;
+    Ok(timing.prompt_eval_count as f64 / (timing.prompt_eval_duration_ms / 1000.0).max(1e-9))
 }
 
 pub fn profile(client: &Client, cfg: &RunConfig, on_progress: &dyn Fn(&str)) -> Result<ProfileResult> {
@@ -135,7 +180,7 @@ pub fn profile(client: &Client, cfg: &RunConfig, on_progress: &dyn Fn(&str)) -> 
         prompt: "warmup",
         stream: false,
         context: None,
-        options: GenerateOptions { num_gpu: cfg.num_gpu, num_ctx: cfg.num_ctx },
+        options: GenerateOptions { num_gpu: cfg.num_gpu, num_ctx: cfg.num_ctx, num_predict: crate::ollama::DEFAULT_NUM_PREDICT },
     })?;
     let actual_vram_fraction = client.vram_fraction(&cfg.model)?;
 
@@ -158,12 +203,13 @@ pub fn profile(client: &Client, cfg: &RunConfig, on_progress: &dyn Fn(&str)) -> 
         }
         cold_timings.push(cold_t);
 
-        on_progress("  immediate reuse...");
+        on_progress("  immediate reuse (context round-tripped through disk)...");
+        let disk_context = round_trip_context_through_disk(&cold_resp.context, "immediate")?;
         let (_, imm_t) = timed_generate(
             client,
             &cfg.model,
             "\n\nQuestion: summarize the above in five words.\nAnswer:",
-            Some(&cold_resp.context),
+            Some(&disk_context),
             cfg.num_gpu,
             cfg.num_ctx,
         )?;
@@ -177,12 +223,13 @@ pub fn profile(client: &Client, cfg: &RunConfig, on_progress: &dyn Fn(&str)) -> 
         let distraction = filler_text(target_chars.min(4000));
         let _ = timed_generate(client, &cfg.model, &distraction, None, cfg.num_gpu, cfg.num_ctx)?;
 
-        on_progress("  delayed reuse...");
+        on_progress("  delayed reuse (context round-tripped through disk)...");
+        let disk_context = round_trip_context_through_disk(&cold_resp.context, "delayed")?;
         let (_, delayed_t) = timed_generate(
             client,
             &cfg.model,
             "\n\nQuestion: name one topic mentioned.\nAnswer:",
-            Some(&cold_resp.context),
+            Some(&disk_context),
             cfg.num_gpu,
             cfg.num_ctx,
         )?;

@@ -34,14 +34,14 @@ pub fn filler_text(target_chars: usize) -> String {
 /// Empirically finds this model's chars-per-token ratio for this word
 /// pool by sending a calibration prompt and reading back how many tokens
 /// Ollama reports it as.
-pub fn calibrate_chars_per_token(client: &Client, model: &str, num_gpu: i32, num_ctx: u32) -> Result<f64> {
+pub fn calibrate_chars_per_token(client: &Client, model: &str, num_gpu: Option<i32>, num_ctx: u32) -> Result<f64> {
     let sample = filler_text(4000);
     let resp = client.generate(&GenerateRequest {
         model,
         prompt: &sample,
         stream: false,
         context: None,
-        options: GenerateOptions { num_gpu, num_ctx },
+        options: GenerateOptions { num_gpu, num_ctx, num_predict: crate::ollama::DEFAULT_NUM_PREDICT },
     })?;
     if resp.prompt_eval_count == 0 {
         bail!("calibration call to `{model}` reported zero prompt tokens");
