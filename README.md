@@ -2,26 +2,37 @@
 
 Profiles a local Ollama server to decide, per `(model, context size, GPU/CPU split)`, whether reusing Ollama's short-lived generation context beats a cold call that reprocesses the same text from scratch - and for how long that benefit actually lasts.
 
+## Two modes
+
+- **Deterministic** (`--predict-only`): no sweep, just real hardware measurements (disk bandwidth, model architecture, one cold prefill) fed into a closed-form formula - see "Determinism" below. Fast; answers "would swap win" with a robust yes/no even when the exact prefill speed carries real uncertainty.
+- **Empirical** (the default, full sweep): measures what Ollama's own short-lived reuse window actually delivers over time (cold / immediate reuse / reuse after a real delay), not a prediction. Slower, but it's the only way to see the window itself degrade, and the only way this project caught real bugs (see "Real results" below) that a prediction alone would have missed.
+
+They answer related but different questions and are meant to be used together: the deterministic mode tells you whether building real disk-swap support is worth it at all; the empirical mode tells you what Ollama can actually deliver *today* without one.
+
 ## Why this exists
 
 Ollama's public API has no real KV-cache-to-disk path - its scheduler unloads whole models rather than tiering the cache, confirmed both by community reporting and by direct measurement in a sibling project ([docuzent](https://github.com/no-mans-code/docuzent)'s `Blueprint.md`). What it *does* have is a short-lived internal reuse window: pass its `context` token array back on a follow-up call and, if nothing has evicted it yet, the follow-up skips reprocessing the shared prefix. This tool measures exactly how short-lived that window is, across model sizes and GPU/CPU splits, rather than assuming one answer applies everywhere.
 
 ## What it actually controls
 
-- **GPU/CPU split**: Ollama's `num_gpu` generate option (`999` for "force full GPU", `0` for "force full CPU") - changing it forces a runner reload at that split, so the same model can be tested fully-VRAM-resident and fully-RAM-resident without needing different-sized models to force the difference. `/api/ps`'s `size_vram`/`size` is read back as ground truth, since a requested split isn't always honored exactly.
+- **GPU/RAM split**: Ollama's `num_gpu` generate option - `999` forces full GPU, `0` forces full CPU, and omitting it entirely (`auto` mode) lets Ollama pick its own placement, spilling whatever doesn't fit into RAM on its own. `auto` is the default RAM-offloading test, not `cpu` - forcing a model fully onto a GPU too small for it (or, worse, fully off it when a partial fit would do) measures a configuration nobody actually runs, and can be dramatically slower or system-destabilizing rather than just "the RAM case" (see "Real results" below). `/api/ps`'s `size_vram`/`size` is read back as ground truth after every run, since a requested split isn't always honored exactly, and `auto`'s real split is never known in advance.
 - **Context size**: Ollama defaults to a 4096-token runtime window regardless of a model's real maximum unless `num_ctx` is passed explicitly - this tool always passes it, sized as a fraction of the model's true max (from `/api/show`'s `model_info`).
 - **Token count**: filler text is sized via an empirically calibrated chars-per-token ratio (measured per model with a real call), not a guessed constant.
 
 ## Usage
 
 ```bash
+# Full empirical sweep (both modes) - measures Ollama's actual reuse window
 cargo run -- \
   --models devstral-small-2:24b,qwen3-coder:30b \
-  --gpu-modes gpu,cpu \
+  --gpu-modes gpu,auto \
   --context-fractions 0.25,0.75 \
   --reps 3 \
   --delay-secs 30 \
   --output results.json
+
+# Deterministic mode - skips the sweep, just the hardware-only crossover prediction
+cargo run -- --models devstral-small-2:24b --gpu-modes gpu,auto --predict-only
 ```
 
 For each `(model, gpu mode, context fraction)`, it measures (averaged over `--reps` repetitions):
@@ -69,6 +80,28 @@ Both sides are measurable without a full sweep:
 **The caveat that keeps this from being the whole answer**: the formula above is context-size-*independent* only in the regime where prefill cost is linear in context length. Real attention cost is quadratic - it grows faster than context length once the sequence gets long enough that attention (not the linear layers) dominates prefill FLOPs. Past that point, reingestion gets *relatively* more expensive as context grows, so real disk swap becomes more attractive at long context even in a config this formula calls a reingest win at short/medium length. Published work confirms the same shape (short contexts favor recompute, contexts in the tens of thousands of tokens increasingly favor offload) without giving one universal crossover token count - it depends on the model's own head-count/head-dim ratio, which changes where the quadratic term starts to dominate. So: **the linear-regime formula above is a real, deterministic, hardware-only answer for short-to-medium context; at very long context, the honest answer is still "profile it" until this tool tracks the quadratic term explicitly** (a natural extension, not built yet).
 
 **Does Ollama's own ephemeral reuse ever capture this benefit today?** No - that's the whole reason for the "Why this exists" section above. The formula predicts what a *real* llama.cpp-backed disk swap could achieve; the empirical sweep measures what Ollama's own short-lived internal cache actually delivers, which our own measurements show degrades to no-benefit within tens of seconds. The gap between "formula says swap should win" and "Ollama can't actually deliver it" is real, measurable opportunity - which is exactly what issue #3 exists to close.
+
+## Real results across 5 configurations (RTX 5080, NVMe ~3.0-3.4 GB/s)
+
+Every one of the 5 successfully-profiled `(model, GPU/RAM mode)` combinations agrees: **swap would win**, by a margin ranging from ~8x to over 1000x depending on the model. No counterexample found yet on this hardware.
+
+| Model | Mode | KV cache | Prefill | Needs | Margin |
+|---|---|---|---|---|---|
+| `qwen2.5:3b` (3.1B dense) | `gpu` (100% VRAM) | 36.0 KB/token | 9,923 tok/s | 366 MB/s | **8.5x** |
+| `devstral-small-2:24b` (23.9B dense) | `gpu` forced (100%\*) | 200.0 KB/token | 45 tok/s | 9 MB/s | **333x** |
+| `devstral-small-2:24b` (23.9B dense) | `auto` (55.9% VRAM) | 200.0 KB/token | **671 tok/s** | 137 MB/s | **22x** |
+| `qwen3-coder:30b` | `gpu` (100%\*) | 48.0 KB/token | 43 tok/s | 2 MB/s | **1,677x** |
+| `qwen3-coder:30b` | `auto` (100%\*) | 48.0 KB/token | 44 tok/s | 2 MB/s | **1,677x** |
+
+\* Ollama reported 100% VRAM residency for models whose total size (22-24GB) exceeds this GPU's 16GB - almost certainly Windows WDDM's shared-GPU-memory oversubscription silently paging into system RAM rather than genuine full-VRAM residency. Treat these "100%" figures as Ollama's self-report, not verified physical fact - a real limitation of `/api/ps` as ground truth on Windows specifically.
+
+**The forced-GPU vs. auto finding that matters operationally, independent of swap-vs-reingest**: for `devstral-small-2:24b`, forcing `num_gpu=999` (all layers to GPU) measured **15x slower** (45 tok/s) than letting Ollama pick its own split (`auto`, 671 tok/s). Forcing every layer onto a GPU too small for the model likely triggers WDDM thrashing between VRAM and shared memory that Ollama's own placement heuristic avoids by keeping the overflow cleanly in RAM instead of fighting the driver for it. This got dramatically worse outside Ollama entirely: driving `gemma4:26b`'s raw GGUF weights directly through `llama-cli` with `-ngl 999` (16.9GB file, 16GB card) caused system-wide thrashing severe enough that `tasklist`/`taskkill` themselves started timing out - the process had to be force-killed via PowerShell. **Forcing full GPU offload on a model that doesn't fit is not a "slower but safe" fallback; it can degrade the whole system, not just that one process.** This is exactly why `auto` mode (Ollama's own placement) replaced forced full-CPU as this tool's default RAM-offloading test, per direct user correction during this research - forcing an artificial extreme in either direction produces a config nobody would actually run and can measure something worse than either real option.
+
+**A real architecture bug this research caught before it corrupted a result**: `gemma4:26b`'s `attention.head_count_kv` is a **per-layer array** (`[8,8,8,8,8,2]` repeated 5x - Gemma's interleaved local/global attention), not one scalar for the whole model. The original code called `.as_u64()` on it, silently got `None`, and fell back to the query head count (16) for every layer - which would have overstated `kv_bytes_per_token` by more than 2x (330 KB/token instead of the correct 144.4 KB/token) without ever erroring. Fixed by detecting the array case and averaging across layers (`num_layers * average` reproduces the true cross-layer sum exactly), with a regression test encoding the real numbers. Any architecture with per-layer-varying attention config would have hit this silently.
+
+**`gemma4:26b` itself could not be fully profiled**: it fails to load at all through the installed Ollama (0.34.4) - `llama_init_from_model: failed to initialize the context: Gemma4Assistant requires ctx_other to be set` - reproduced with and without any custom options, and unchanged after a full re-pull, confirming a genuine Ollama/llama.cpp-integration bug for this specific model rather than a corrupted download. Notably, **raw llama.cpp (`llama-cli`, official b11227 Windows/CUDA build) loads the same GGUF weights successfully** (reached its interactive prompt) - strong evidence this is specifically a defect in Ollama's bundled/forked llama.cpp version, not the model file or upstream llama.cpp. Real prefill numbers for this model were not safely obtained this session (see thrashing finding above); a follow-up with a sane `-ngl` value (not the forced extreme) is the natural next step, tracked under issue #3.
+
+**One more real architecture detail worth flagging**: `gemma4:26b`'s Ollama manifest reveals it bundles three components under one tag - the main weights (16.9GB, filename references `26B-A4B`, the standard naming for "26B total, ~4B *active*" Mixture-of-Experts parameters), a 1.2GB vision projector, and a 461MB speculative-decoding draft model. `general.parameter_count` (25.2B) reports the *total*, not the active-per-token count that actually drives prefill FLOPs for an MoE model - a real gap in the current formula, which assumes a dense forward pass. `hardware::kv_bytes_per_token` is unaffected (KV cache size depends on attention configuration, not the MoE routing), but a future FLOPs-based *tokens/sec* predictor (see "Where precision breaks down" note in commit history) would need to account for this separately for MoE architectures.
 
 ## Help make this better for everyone
 

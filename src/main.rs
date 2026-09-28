@@ -94,7 +94,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to read `{model}`'s architecture info"))?;
         let kv_bytes = kv_bytes_per_token(arch.num_layers, arch.num_kv_heads, arch.head_dim, cli.kv_dtype_bytes);
         println!(
-            "\n=== {model} (max context {max_ctx} tokens, {} layers, {} KV heads x {} dim -> {:.1} KB/token KV cache) ===",
+            "\n=== {model} (max context {max_ctx} tokens, {} layers, {:.1} avg KV heads x {:.0} dim -> {:.1} KB/token KV cache) ===",
             arch.num_layers,
             arch.num_kv_heads,
             arch.head_dim,

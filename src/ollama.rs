@@ -17,13 +17,17 @@ pub struct Client {
 
 /// The architecture parameters that determine a model's KV-cache size per
 /// token: `2 * num_layers * num_kv_heads * head_dim * dtype_bytes`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ArchitectureInfo {
     pub num_layers: u32,
     /// The *key/value* head count, not the (often larger) query head count
     /// grouped-query attention models report separately.
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    /// Not always a whole number: some architectures (Gemma's interleaved
+    /// local/global attention) vary this per layer, and this is the
+    /// average across layers - `num_layers * this` still reproduces the
+    /// true total exactly.
+    pub num_kv_heads: f64,
+    pub head_dim: f64,
 }
 
 impl Client {
@@ -71,21 +75,41 @@ impl Client {
         let find_u64 = |suffix: &str| -> Option<u64> {
             model_info.iter().find(|(k, _)| k.ends_with(suffix)).and_then(|(_, v)| v.as_u64())
         };
+        // Some architectures (Gemma's interleaved local/global attention is
+        // the real example that forced this) report head counts as a
+        // per-layer array, not one scalar for the whole model - e.g.
+        // gemma4.attention.head_count_kv = [8,8,8,8,8,2,...]. Averaging the
+        // array and multiplying by num_layers elsewhere reproduces the true
+        // total exactly (num_layers * average = sum), so this is not an
+        // approximation as long as the array's length matches block_count -
+        // checked below rather than assumed.
+        let find_avg_u64 = |suffix: &str| -> Option<f64> {
+            let v = model_info.iter().find(|(k, _)| k.ends_with(suffix)).map(|(_, v)| v)?;
+            if let Some(n) = v.as_u64() {
+                return Some(n as f64);
+            }
+            let arr = v.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            let sum: u64 = arr.iter().filter_map(|x| x.as_u64()).sum();
+            Some(sum as f64 / arr.len() as f64)
+        };
 
         let num_layers = find_u64(".block_count").with_context(|| format!("no *.block_count for `{model}`"))?;
-        let embedding_length = find_u64(".embedding_length").with_context(|| format!("no *.embedding_length for `{model}`"))?;
-        let head_count = find_u64(".attention.head_count").with_context(|| format!("no *.attention.head_count for `{model}`"))?;
+        let embedding_length = find_avg_u64(".embedding_length").with_context(|| format!("no *.embedding_length for `{model}`"))?;
+        let head_count = find_avg_u64(".attention.head_count").with_context(|| format!("no *.attention.head_count for `{model}`"))?;
         // Grouped-query attention models report a smaller KV head count
         // separately - that's what actually sets KV-cache size, not the
         // (larger) query head count. Falls back to head_count for
         // architectures that don't use GQA and so don't report it.
-        let num_kv_heads = find_u64(".attention.head_count_kv").unwrap_or(head_count);
-        let head_dim = embedding_length / head_count.max(1);
+        let num_kv_heads = find_avg_u64(".attention.head_count_kv").unwrap_or(head_count);
+        let head_dim = embedding_length / head_count.max(1.0);
 
         Ok(ArchitectureInfo {
             num_layers: num_layers as u32,
-            num_kv_heads: num_kv_heads as u32,
-            head_dim: head_dim as u32,
+            num_kv_heads,
+            head_dim,
         })
     }
 

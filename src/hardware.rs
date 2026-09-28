@@ -55,9 +55,13 @@ pub fn measure_disk_read_bandwidth_bytes_per_sec(size_bytes: usize) -> Result<f6
 /// KV-cache bytes per token: `2 (K and V) * num_layers * num_kv_heads *
 /// head_dim * kv_dtype_bytes`. `kv_dtype_bytes` is 2 for Ollama's default
 /// f16 KV cache; pass a smaller value if KV-cache quantization is
-/// configured (e.g. 1 for q8_0).
-pub fn kv_bytes_per_token(num_layers: u32, num_kv_heads: u32, head_dim: u32, kv_dtype_bytes: u32) -> u64 {
-    2 * num_layers as u64 * num_kv_heads as u64 * head_dim as u64 * kv_dtype_bytes as u64
+/// configured (e.g. 1 for q8_0). `num_kv_heads`/`head_dim` take `f64`
+/// since some architectures (Gemma's interleaved local/global attention)
+/// vary head count per layer - `ollama::Client::architecture_info` passes
+/// the per-layer average, and `num_layers * average` reproduces the true
+/// cross-layer total exactly.
+pub fn kv_bytes_per_token(num_layers: u32, num_kv_heads: f64, head_dim: f64, kv_dtype_bytes: u32) -> u64 {
+    (2.0 * num_layers as f64 * num_kv_heads * head_dim * kv_dtype_bytes as f64).round() as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -93,8 +97,25 @@ mod tests {
         // qwen2.5:3b, from real /api/show output: block_count=36,
         // head_count_kv=2, embedding_length=2048, head_count=16 ->
         // head_dim=128. f16 KV cache (2 bytes).
-        let bytes = kv_bytes_per_token(36, 2, 128, 2);
+        let bytes = kv_bytes_per_token(36, 2.0, 128.0, 2);
         assert_eq!(bytes, 36_864);
+    }
+
+    #[test]
+    fn kv_bytes_matches_hand_calculation_for_gemma4_26b_per_layer_heads() {
+        // gemma4:26b, from real /api/show output: block_count=30,
+        // head_count_kv=[8,8,8,8,8,2] repeated 5x (interleaved local/global
+        // attention - NOT one scalar for the whole model), embedding_length
+        // =2816, head_count=16 -> head_dim=176. Average kv_heads across the
+        // 30-entry array = (25*8 + 5*2) / 30 = 7.0 exactly.
+        let avg_kv_heads = (25.0 * 8.0 + 5.0 * 2.0) / 30.0;
+        assert_eq!(avg_kv_heads, 7.0);
+        let bytes = kv_bytes_per_token(30, avg_kv_heads, 176.0, 2);
+        // 2 * 30 * 7.0 * 176 * 2 = 147,840 - more than double what a naive
+        // "use the query head count (16) for every layer" fallback would
+        // have given (2*30*16*176*2 = 337,920), which is exactly the bug
+        // this test exists to catch a regression of.
+        assert_eq!(bytes, 147_840);
     }
 
     #[test]

@@ -15,8 +15,8 @@ fn predicts_a_real_crossover_from_live_measurements() {
     let max_ctx = client.max_context_length(MODEL).expect("ollama must be running with the model pulled");
     let arch = client.architecture_info(MODEL).unwrap();
     assert!(arch.num_layers > 0);
-    assert!(arch.num_kv_heads > 0);
-    assert!(arch.head_dim > 0);
+    assert!(arch.num_kv_heads > 0.0);
+    assert!(arch.head_dim > 0.0);
 
     let kv_bytes = kv_bytes_per_token(arch.num_layers, arch.num_kv_heads, arch.head_dim, 2);
     // qwen2.5:3b is a known architecture: 36 layers, 2 KV heads (GQA), 128 head_dim, f16 -> 36864 B/token exactly.
@@ -79,5 +79,36 @@ fn real_predictions_for_devstral_and_qwen_coder() {
                 prediction.disk_swap_would_win_at_short_to_medium_context
             );
         }
+    }
+}
+
+/// Same as above, for gemma4:26b - a model architecture that forced a real
+/// bug fix (per-layer KV head arrays, see hardware::tests) and that does
+/// not fit in this machine's 16GB VRAM (18.6GB on disk), so "auto" mode
+/// here is a genuine RAM-offloading test, not a formality.
+#[test]
+#[ignore]
+fn real_predictions_for_gemma4_26b() {
+    let client = Client::new(HOST);
+    let model = "gemma4:26b";
+    let max_ctx = client.max_context_length(model).unwrap();
+    let arch = client.architecture_info(model).unwrap();
+    println!("gemma4:26b architecture: {arch:?}");
+    let kv_bytes = kv_bytes_per_token(arch.num_layers, arch.num_kv_heads, arch.head_dim, 2);
+    let disk_bandwidth = measure_disk_read_bandwidth_bytes_per_sec(64 * 1024 * 1024).unwrap();
+    let num_ctx = ((max_ctx as f64 * 0.15) as u32).max(512);
+    let target_tokens = (num_ctx as u64).saturating_sub(200);
+
+    for (label, num_gpu) in [("gpu", Some(999)), ("auto", None)] {
+        let tokens_per_sec = ollama_kv_profiler::bench::quick_cold_tokens_per_sec(&client, model, num_gpu, num_ctx, target_tokens).unwrap();
+        let actual_vram = client.vram_fraction(model).unwrap();
+        let prediction = predict_crossover(kv_bytes, disk_bandwidth, tokens_per_sec);
+        println!(
+            "{model} [{label}, vram={actual_vram:?}] {:.1} KB/token, {tokens_per_sec:.0} tok/s, needs {:.0} MB/s, disk {:.0} MB/s -> swap wins: {}",
+            kv_bytes as f64 / 1024.0,
+            prediction.required_bandwidth_bytes_per_sec / 1e6,
+            disk_bandwidth / 1e6,
+            prediction.disk_swap_would_win_at_short_to_medium_context
+        );
     }
 }
