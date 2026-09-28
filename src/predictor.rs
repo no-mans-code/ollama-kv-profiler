@@ -57,6 +57,34 @@
 //! `hardware.rs` remains a valid *hardware* characterization (relevant if
 //! a real KV-tensor cache, e.g. llama.cpp's own prompt-cache files, were
 //! ever used instead) - it just isn't what this live path measures.
+//!
+//! Two more real refinements, both found by comparing residual error
+//! (actual minus predicted) across model sizes rather than assuming the
+//! formula above was the end of it:
+//!
+//! - `fixed_overhead_ms` was originally calibrated from a trivial
+//!   context-free `"hi"` call (~15-35ms measured) - but the real swap call
+//!   attaches a multi-thousand-token context array, and the residual
+//!   overhead measured against *realistically-shaped* calls (real context
+//!   attached, real follow-up prompt) was consistently larger (~45-50ms)
+//!   and, crucially, nearly identical between a 3B and a 14B model despite
+//!   very different architectures - the signature of a real fixed cost the
+//!   trivial calibration was underestimating, not something the earlier
+//!   version's formula terms already captured. Calibration now reuses the
+//!   same real-context draws already needed for `expected_answer_tokens`,
+//!   no extra round trips.
+//! - `prefill_tokens_per_sec`/`eval_tokens_per_sec` were originally
+//!   measured once from a single seed call and held fixed for an entire
+//!   `validate()` run. Under real contention that assumption breaks: a
+//!   30b-model run under 97% VRAM contention showed a swap residual 7-8x
+//!   larger in absolute terms than smaller models under lighter
+//!   contention, consistent with the model's *own* real decode speed
+//!   drifting between calibration time and each rep rather than a missing
+//!   formula term. Every rep's ingest call already pays for a fresh real
+//!   prefill+eval measurement as a side effect (it processes the document,
+//!   then generates `DEFAULT_NUM_PREDICT` tokens) - `validate()` now
+//!   refreshes `speed` from each rep's own ingest timing before predicting
+//!   that rep's swap, at no extra request cost.
 
 use std::path::Path;
 
@@ -99,9 +127,13 @@ pub struct TimePrediction {
 /// prediction needs to know its shape, not just the cached document's size.
 pub const FOLLOW_UP_PROMPT: &str = "\n\nQuestion: summarize the above in five words.\nAnswer:";
 
-/// A model+device's measured speed, held fixed across a `validate()` run
-/// (see [`predict`]'s doc comment for why re-measuring every prediction
-/// would mostly add noise rather than signal).
+/// A model+device's measured speed. `prefill_tokens_per_sec` and
+/// `eval_tokens_per_sec` are refreshed every rep from that rep's own real
+/// ingest timing (see module doc comment - a one-time measurement was
+/// found to drift badly under real contention); the other fields are
+/// calibrated once up front, since they're stable properties of the
+/// prompt shape and serialization format rather than moment-to-moment
+/// hardware conditions.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpeed {
     pub prefill_tokens_per_sec: f64,
@@ -119,13 +151,15 @@ pub struct ModelSpeed {
     /// `hardware::kv_bytes_per_token`'s theoretical KV-tensor size (see
     /// module doc comment for why conflating the two overshot badly).
     pub disk_bytes_per_token: f64,
-    /// Fixed per-call HTTP/scheduling latency that neither Ollama's own
-    /// `prompt_eval_duration` nor `eval_duration` accounts for - measured
-    /// directly via a near-zero-work call (`wall_ms` minus both reported
-    /// durations). Only added to the swap prediction, since swap's actual
-    /// measurement is real wall-clock time (it must pay this cost) while
-    /// ingest's actual measurement uses Ollama's own reported duration
-    /// (which doesn't).
+    /// Fixed per-call latency that neither Ollama's own `prompt_eval_duration`
+    /// nor `eval_duration` accounts for - measured as the residual
+    /// (`wall_ms` minus both reported durations) on calls shaped like the
+    /// real swap call (real context attached, real follow-up prompt), not
+    /// a trivial context-free call (see module doc comment for why that
+    /// distinction matters). Only added to the swap prediction, since
+    /// swap's actual measurement is real wall-clock time (it must pay this
+    /// cost) while ingest's actual measurement uses Ollama's own reported
+    /// duration (which doesn't).
     pub fixed_overhead_ms: f64,
 }
 
@@ -214,9 +248,10 @@ pub struct ValidationOutcome {
 /// Runs `reps` rounds, each producing one real "ingest" outcome (a fresh,
 /// never-seen document - tests the ingest-time prediction) immediately
 /// followed by one real "swap" outcome (the same document, now cached -
-/// tests the swap-time prediction). `prefill_tokens_per_sec` is measured
-/// once up front via a real calibration call and held fixed across reps
-/// (see [`predict`]'s doc comment for why).
+/// tests the swap-time prediction). `prefill_tokens_per_sec` and
+/// `eval_tokens_per_sec` start from a real seed calibration call, then get
+/// refreshed every rep from that rep's own real ingest timing (see module
+/// doc comment for why a one-time measurement wasn't enough).
 pub fn validate(
     client: &Client,
     cache: &DocumentCache,
@@ -263,9 +298,19 @@ pub fn validate(
     // greedy, so a single draw is noisy (the same real prompt was
     // observed to produce 6, 11, 7, 7, and 7 tokens across five repeated
     // calls) - averaging several draws is needed for a stable estimate.
+    //
+    // The same real-context-attached draws also give a much more honest
+    // `fixed_overhead_ms` than a trivial `"hi"`/no-context call would: the
+    // residual (`wall_ms` minus both reported durations) on a call shaped
+    // exactly like the real swap call captures whatever Ollama pays to
+    // attach a large context that a context-free call never would (see
+    // module doc comment - this alone closed most of the remaining gap on
+    // 3B/14B testing).
     const ANSWER_CALIBRATION_DRAWS: usize = 5;
     let mut answer_token_draws = Vec::with_capacity(ANSWER_CALIBRATION_DRAWS);
+    let mut overhead_draws = Vec::with_capacity(ANSWER_CALIBRATION_DRAWS);
     for _ in 0..ANSWER_CALIBRATION_DRAWS {
+        let t0 = std::time::Instant::now();
         let draw = client.generate(&GenerateRequest {
             model,
             prompt: FOLLOW_UP_PROMPT,
@@ -273,32 +318,15 @@ pub fn validate(
             context: Some(&seed_resp.context),
             options: GenerateOptions { num_gpu, num_ctx, num_predict: 64 },
         })?;
-        answer_token_draws.push(draw.eval_count as f64);
-    }
-    let expected_answer_tokens = (answer_token_draws.iter().sum::<f64>() / answer_token_draws.len() as f64).max(1.0);
-
-    // Fixed per-call latency neither `prompt_eval_duration` nor
-    // `eval_duration` accounts for (HTTP round trip, Ollama's own request
-    // scheduling) - measured directly via near-zero-work calls, dropping
-    // the first (still paying leftover warmup/runner-state variance).
-    const OVERHEAD_CALIBRATION_DRAWS: usize = 4;
-    let mut overhead_draws = Vec::with_capacity(OVERHEAD_CALIBRATION_DRAWS);
-    for _ in 0..OVERHEAD_CALIBRATION_DRAWS {
-        let t0 = std::time::Instant::now();
-        let draw = client.generate(&GenerateRequest {
-            model,
-            prompt: "hi",
-            stream: false,
-            context: None,
-            options: GenerateOptions { num_gpu, num_ctx, num_predict: 1 },
-        })?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let reported_ms = draw.prompt_eval_duration as f64 / 1e6 + draw.eval_duration as f64 / 1e6;
+        answer_token_draws.push(draw.eval_count as f64);
         overhead_draws.push((wall_ms - reported_ms).max(0.0));
     }
-    let fixed_overhead_ms = overhead_draws[1..].iter().sum::<f64>() / (overhead_draws.len() - 1) as f64;
+    let expected_answer_tokens = (answer_token_draws.iter().sum::<f64>() / answer_token_draws.len() as f64).max(1.0);
+    let fixed_overhead_ms = overhead_draws.iter().sum::<f64>() / overhead_draws.len() as f64;
 
-    let speed = ModelSpeed { prefill_tokens_per_sec, eval_tokens_per_sec, chars_per_token, expected_answer_tokens, disk_bytes_per_token, fixed_overhead_ms };
+    let mut speed = ModelSpeed { prefill_tokens_per_sec, eval_tokens_per_sec, chars_per_token, expected_answer_tokens, disk_bytes_per_token, fixed_overhead_ms };
     on_progress(&format!(
         "seeded prefill speed: {prefill_tokens_per_sec:.0} tok/s, eval speed: {eval_tokens_per_sec:.0} tok/s, expected answer length: {expected_answer_tokens:.0} tokens, real disk payload: {disk_bytes_per_token:.1} bytes/token, fixed overhead: {fixed_overhead_ms:.1}ms"
     ));
@@ -321,6 +349,20 @@ pub fn validate(
 
         let (resp, timing) = timed_generate(client, model, &text, None, num_gpu, num_ctx)?;
         let actual_ms = timing.prompt_eval_duration_ms;
+
+        // Refresh from this rep's own real timing rather than trusting the
+        // one-time seed measurement for the rest of the run - real decode
+        // speed can drift under contention (see module doc comment for why
+        // a static estimate badly underpredicted a 30B run's swap time
+        // under heavy VRAM pressure). Free: this call already pays for
+        // both measurements as a side effect of ingesting the document.
+        if timing.prompt_eval_duration_ms > 0.0 {
+            speed.prefill_tokens_per_sec = timing.prompt_eval_count as f64 / (timing.prompt_eval_duration_ms / 1000.0);
+        }
+        if timing.eval_duration_ms > 0.0 {
+            speed.eval_tokens_per_sec = timing.eval_count as f64 / (timing.eval_duration_ms / 1000.0);
+        }
+
         outcomes.push(ValidationOutcome {
             rep,
             scenario: "ingest",
