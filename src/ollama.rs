@@ -35,16 +35,43 @@ impl Client {
         Self { host: host.into() }
     }
 
+    /// POSTs a JSON body and returns the parsed JSON response. On a
+    /// non-2xx status, surfaces Ollama's own `{"error": "..."}` body
+    /// rather than just the HTTP status code - the status code alone
+    /// (e.g. "status code 500") gives no clue what actually went wrong,
+    /// which cost real time during this project's own research (had to
+    /// manually `curl` the same request outside the tool to discover why
+    /// a model failed to load). See issue #5.
+    fn post_json<T: for<'de> Deserialize<'de>>(&self, path: &str, body: impl Serialize) -> Result<T> {
+        let url = format!("{}{path}", self.host.trim_end_matches('/'));
+        match ureq::post(&url).send_json(body) {
+            Ok(resp) => resp.into_json().with_context(|| format!("failed to parse response from {url}")),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_else(|_| "<no body>".to_string());
+                bail!("{url} returned HTTP {code}: {body}")
+            }
+            Err(e) => Err(e).with_context(|| format!("request to {url} failed - is `ollama serve` running?")),
+        }
+    }
+
+    /// Same as [`Self::post_json`] but for a plain GET (no request body).
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{path}", self.host.trim_end_matches('/'));
+        match ureq::get(&url).call() {
+            Ok(resp) => resp.into_json().with_context(|| format!("failed to parse response from {url}")),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_else(|_| "<no body>".to_string());
+                bail!("{url} returned HTTP {code}: {body}")
+            }
+            Err(e) => Err(e).with_context(|| format!("request to {url} failed - is `ollama serve` running?")),
+        }
+    }
+
     /// The model's real maximum context window, from `/api/show`'s
     /// `model_info["<family>.context_length"]` (found by suffix - the
     /// family prefix varies per architecture).
     pub fn max_context_length(&self, model: &str) -> Result<u32> {
-        let url = format!("{}/api/show", self.host.trim_end_matches('/'));
-        let resp: Value = ureq::post(&url)
-            .send_json(serde_json::json!({ "model": model }))
-            .with_context(|| format!("ollama show request to {url} failed - is `ollama serve` running?"))?
-            .into_json()
-            .context("failed to parse ollama show response")?;
+        let resp: Value = self.post_json("/api/show", serde_json::json!({ "model": model }))?;
         let model_info = resp.get("model_info").context("no model_info in show response")?;
         let context_length = model_info
             .as_object()
@@ -61,12 +88,7 @@ impl Client {
     /// an architecture-family prefix (`qwen2.*`, `llama.*`, ...), found by
     /// suffix rather than hardcoded per family, same as `max_context_length`.
     pub fn architecture_info(&self, model: &str) -> Result<ArchitectureInfo> {
-        let url = format!("{}/api/show", self.host.trim_end_matches('/'));
-        let resp: Value = ureq::post(&url)
-            .send_json(serde_json::json!({ "model": model }))
-            .with_context(|| format!("ollama show request to {url} failed"))?
-            .into_json()
-            .context("failed to parse ollama show response")?;
+        let resp: Value = self.post_json("/api/show", serde_json::json!({ "model": model }))?;
         let model_info = resp
             .get("model_info")
             .and_then(|v| v.as_object())
@@ -117,12 +139,7 @@ impl Client {
     /// in VRAM, from `/api/ps` - more reliable than trusting a requested
     /// `num_gpu` blindly, since not every split is honored exactly.
     pub fn vram_fraction(&self, model: &str) -> Result<Option<f64>> {
-        let url = format!("{}/api/ps", self.host.trim_end_matches('/'));
-        let resp: PsResponse = ureq::get(&url)
-            .call()
-            .with_context(|| format!("ollama ps request to {url} failed"))?
-            .into_json()
-            .context("failed to parse ollama ps response")?;
+        let resp: PsResponse = self.get_json("/api/ps")?;
         Ok(resp
             .models
             .into_iter()
@@ -137,12 +154,7 @@ impl Client {
     }
 
     pub fn generate(&self, req: &GenerateRequest) -> Result<GenerateResponse> {
-        let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
-        let resp: GenerateResponse = ureq::post(&url)
-            .send_json(req)
-            .with_context(|| format!("ollama generate request to {url} failed"))?
-            .into_json()
-            .context("failed to parse ollama generate response")?;
+        let resp: GenerateResponse = self.post_json("/api/generate", req)?;
         if resp.response.is_empty() && resp.prompt_eval_count == 0 {
             bail!("empty response from ollama - model may have failed to load");
         }
