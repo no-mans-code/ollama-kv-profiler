@@ -141,7 +141,6 @@ pub struct ModelSpeed {
     /// takes, which is the dominant real cost of a "swap" call for slow
     /// models (see [`predict`]'s doc comment).
     pub eval_tokens_per_sec: f64,
-    pub chars_per_token: f64,
     /// How many tokens the model actually generates for [`FOLLOW_UP_PROMPT`]
     /// before hitting a real stop (EOS/newline) - measured, not assumed
     /// from `num_predict` (see module doc comment for why that overshot).
@@ -169,6 +168,14 @@ pub struct ModelSpeed {
 /// not tokens/sec, which is stable enough per model+device that
 /// re-measuring it every single prediction would mostly just add noise.
 ///
+/// `follow_up_tokens` is the caller's - not baked in as [`FOLLOW_UP_PROMPT`]
+/// used to be, since a real caller's "follow-up" isn't necessarily that
+/// fixed calibration prompt (e.g. docuzent's is an arbitrary real user
+/// question, wildly variable in length) - callers that *are* replaying
+/// `FOLLOW_UP_PROMPT` (this crate's own `validate()`) compute it the same
+/// way `predict` used to internally: `FOLLOW_UP_PROMPT`'s char count over
+/// a measured chars-per-token ratio.
+///
 /// The swap estimate is disk read + Ollama's own real per-call overhead:
 /// reprocessing the short follow-up question (prefill-bound) and
 /// generating the answer (eval/decode-bound, `num_predict` tokens). A
@@ -182,13 +189,14 @@ pub struct ModelSpeed {
 pub fn predict(
     document_tokens: u64,
     speed: &ModelSpeed,
+    follow_up_tokens: f64,
     snapshot: &SystemSnapshot,
     cache_hit: bool,
 ) -> TimePrediction {
     let predicted_ingest_ms = document_tokens as f64 / speed.prefill_tokens_per_sec.max(1e-9) * 1000.0;
     let predicted_swap_ms = if cache_hit {
         let disk_ms = document_tokens as f64 * speed.disk_bytes_per_token / snapshot.disk_bandwidth_bytes_per_sec.max(1e-9) * 1000.0;
-        let follow_up_tokens = (FOLLOW_UP_PROMPT.chars().count() as f64 / speed.chars_per_token.max(1e-9)).max(1.0);
+        let follow_up_tokens = follow_up_tokens.max(1.0);
         let follow_up_prefill_ms = follow_up_tokens / speed.prefill_tokens_per_sec.max(1e-9) * 1000.0;
         let answer_eval_ms = speed.expected_answer_tokens / speed.eval_tokens_per_sec.max(1e-9) * 1000.0;
         Some(disk_ms + follow_up_prefill_ms + answer_eval_ms + speed.fixed_overhead_ms)
@@ -326,7 +334,10 @@ pub fn validate(
     let expected_answer_tokens = (answer_token_draws.iter().sum::<f64>() / answer_token_draws.len() as f64).max(1.0);
     let fixed_overhead_ms = overhead_draws.iter().sum::<f64>() / overhead_draws.len() as f64;
 
-    let mut speed = ModelSpeed { prefill_tokens_per_sec, eval_tokens_per_sec, chars_per_token, expected_answer_tokens, disk_bytes_per_token, fixed_overhead_ms };
+    let mut speed = ModelSpeed { prefill_tokens_per_sec, eval_tokens_per_sec, expected_answer_tokens, disk_bytes_per_token, fixed_overhead_ms };
+    // `predict` takes follow-up token count from the caller now (see its
+    // doc comment) - this is the one real shape `validate` itself uses.
+    let follow_up_tokens = (FOLLOW_UP_PROMPT.chars().count() as f64 / chars_per_token.max(1e-9)).max(1.0);
     on_progress(&format!(
         "seeded prefill speed: {prefill_tokens_per_sec:.0} tok/s, eval speed: {eval_tokens_per_sec:.0} tok/s, expected answer length: {expected_answer_tokens:.0} tokens, real disk payload: {disk_bytes_per_token:.1} bytes/token, fixed overhead: {fixed_overhead_ms:.1}ms"
     ));
@@ -345,7 +356,7 @@ pub fn validate(
         if let Some(w) = hardware::fairness_warning("system RAM", snapshot.ram_free_fraction) {
             on_progress(&w);
         }
-        let prediction = predict(target_tokens, &speed, &snapshot, false);
+        let prediction = predict(target_tokens, &speed, follow_up_tokens, &snapshot, false);
 
         let (resp, timing) = timed_generate(client, model, &text, None, num_gpu, num_ctx)?;
         let actual_ms = timing.prompt_eval_duration_ms;
@@ -387,7 +398,7 @@ pub fn validate(
         let t0 = std::time::Instant::now();
         let cached = cache.get(model, num_ctx, &doc_hash)?;
         let cache_hit = cached.is_some();
-        let prediction = predict(target_tokens, &speed, &snapshot, cache_hit);
+        let prediction = predict(target_tokens, &speed, follow_up_tokens, &snapshot, cache_hit);
 
         if let Some(context) = cached {
             let _ = timed_generate(client, model, FOLLOW_UP_PROMPT, Some(&context), num_gpu, num_ctx)?;
@@ -427,30 +438,30 @@ mod tests {
         ModelSpeed {
             prefill_tokens_per_sec: 5000.0,
             eval_tokens_per_sec: 100.0,
-            chars_per_token: 4.0,
             expected_answer_tokens: 9.0,
             disk_bytes_per_token: 8.0,
             fixed_overhead_ms: 35.0,
         }
     }
 
+    const FOLLOW_UP_TOKENS: f64 = 14.0; // FOLLOW_UP_PROMPT.chars().count() / 4.0 chars-per-token, rounded up
+
     #[test]
     fn predict_gives_no_swap_estimate_without_a_cache_hit() {
-        let p = predict(1000, &speed(), &snapshot(), false);
+        let p = predict(1000, &speed(), FOLLOW_UP_TOKENS, &snapshot(), false);
         assert_eq!(p.predicted_ingest_ms, 200.0); // 1000 tokens / 5000 tok/s = 0.2s = 200ms
         assert!(p.predicted_swap_ms.is_none());
     }
 
     #[test]
     fn predict_gives_a_swap_estimate_on_a_cache_hit() {
-        let p = predict(1000, &speed(), &snapshot(), true);
+        let p = predict(1000, &speed(), FOLLOW_UP_TOKENS, &snapshot(), true);
         // disk: 1000 tokens * 8 B/token / 3e9 B/s * 1000 = 0.00267 ms
-        // follow-up prefill: ceil(56 chars / 4 chars/tok) tokens / 5000 tok/s * 1000
+        // follow-up prefill: 14 tokens / 5000 tok/s * 1000
         // answer eval: 9 tokens (measured expected_answer_tokens) / 100 tok/s * 1000 = 90ms
         // fixed overhead: 35ms (measured)
         let disk_ms = 1000.0 * 8.0 / 3_000_000_000.0 * 1000.0;
-        let follow_up_tokens = (FOLLOW_UP_PROMPT.chars().count() as f64 / 4.0).max(1.0);
-        let follow_up_ms = follow_up_tokens / 5000.0 * 1000.0;
+        let follow_up_ms = FOLLOW_UP_TOKENS / 5000.0 * 1000.0;
         let answer_ms = 9.0 / 100.0 * 1000.0;
         let expected = disk_ms + follow_up_ms + answer_ms + 35.0;
         assert!((p.predicted_swap_ms.unwrap() - expected).abs() < 0.001);
@@ -462,7 +473,7 @@ mod tests {
         // negligible regardless of model size (see module doc comment) -
         // the follow-up prefill + answer decode terms should dwarf the
         // disk term even for a large document.
-        let p = predict(100_000, &speed(), &snapshot(), true);
+        let p = predict(100_000, &speed(), FOLLOW_UP_TOKENS, &snapshot(), true);
         let disk_only_ms = 100_000.0 * 8.0 / 3_000_000_000.0 * 1000.0;
         assert!(p.predicted_swap_ms.unwrap() > disk_only_ms * 10.0);
     }
